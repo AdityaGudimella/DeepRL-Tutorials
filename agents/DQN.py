@@ -10,6 +10,10 @@ from utils.ReplayMemory import ExperienceReplayMemory, PrioritizedReplayMemory
 
 from timeit import default_timer as timer
 
+from morl import api
+from morl import core
+from morl import experiences as exp
+
 class Model(BaseAgent):
     def __init__(self, static_policy=False, env=None, config=None, log_dir='/tmp/gym'):
         super(Model, self).__init__(config=config, env=env, log_dir=log_dir)
@@ -31,15 +35,21 @@ class Model(BaseAgent):
         self.priority_alpha = config.PRIORITY_ALPHA
 
         self.static_policy = static_policy
-        self.num_feats = env.observation_space.shape
-        self.num_actions = env.action_space.n
+        if isinstance(env, api.MorlEnv):
+            self.env_spec = env.get_partial_spec()
+            self.num_feats = self.env_spec.state_space.shape
+            self.num_actions = self.env_spec.action_space.n
+        else:
+            self.num_feats = env.observation_space.shape
+            self.num_actions = env.action_space.n
+        print(self.num_feats, self.num_actions)
         self.env = env
 
         self.declare_networks()
-            
+
         self.target_model.load_state_dict(self.model.state_dict())
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        
+
         #move to correct device
         self.model = self.model.to(self.device)
         self.target_model.to(self.device)
@@ -70,7 +80,7 @@ class Model(BaseAgent):
 
         if(len(self.nstep_buffer)<self.nsteps):
             return
-        
+
         R = sum([self.nstep_buffer[i][2]*(self.gamma**i) for i in range(self.nsteps)])
         state, action, _, _ = self.nstep_buffer.pop(0)
 
@@ -79,15 +89,15 @@ class Model(BaseAgent):
     def prep_minibatch(self):
         # random transition batch is taken from experience replay memory
         transitions, indices, weights = self.memory.sample(self.batch_size)
-        
+
         batch_state, batch_action, batch_reward, batch_next_state = zip(*transitions)
 
         shape = (-1,)+self.num_feats
 
-        batch_state = torch.tensor(batch_state, device=self.device, dtype=torch.float).view(shape)
+        batch_state = torch.tensor(batch_state, device=self.device, dtype=torch.float).view(shape).to(torch.float32).div(255)
         batch_action = torch.tensor(batch_action, device=self.device, dtype=torch.long).squeeze().view(-1, 1)
         batch_reward = torch.tensor(batch_reward, device=self.device, dtype=torch.float).squeeze().view(-1, 1)
-        
+
         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch_next_state)), device=self.device, dtype=torch.uint8)
         try: #sometimes all next states are false
             non_final_next_states = torch.tensor([s for s in batch_next_state if s is not None], device=self.device, dtype=torch.float).view(shape)
@@ -95,6 +105,7 @@ class Model(BaseAgent):
         except:
             non_final_next_states = None
             empty_next_state_values = True
+        non_final_next_states = non_final_next_states.to(torch.float32).div(255)
 
         return batch_state, batch_action, batch_reward, non_final_next_states, non_final_mask, empty_next_state_values, indices, weights
 
@@ -104,7 +115,7 @@ class Model(BaseAgent):
         #estimate
         self.model.sample_noise()
         current_q_values = self.model(batch_state).gather(1, batch_action)
-        
+
         #target
         with torch.no_grad():
             max_next_q_values = torch.zeros(self.batch_size, device=self.device, dtype=torch.float).unsqueeze(dim=1)
@@ -123,6 +134,68 @@ class Model(BaseAgent):
         loss = loss.mean()
 
         return loss
+
+    def morl_compute_loss(self, tensor_exp: exp.TensorExperience) -> torch.Tensor:
+        self.model.sample_noise()
+        print(tensor_exp.states.shape, tensor_exp.actions.shape)
+        current_q_values = self.model(tensor_exp.states).gather(1, tensor_exp.actions.long())
+
+        #target
+        with torch.no_grad():
+            # max_next_q_values = torch.zeros(self.batch_size, device=self.device, dtype=torch.float).unsqueeze(dim=1)
+            # if not empty_next_state_values:
+            #     max_next_action = self.get_max_next_state_action(non_final_next_states)
+            #     self.target_model.sample_noise()
+            #     max_next_q_values[non_final_mask] = self.target_model(non_final_next_states).gather(1, max_next_action)
+            max_next_action = self.get_max_next_state_action(tensor_exp.next_states)
+            max_next_q_values = self.target_model(tensor_exp.next_states).gather(
+                1, max_next_action
+            )
+            expected_q_values = (
+                tensor_exp.rewards
+                + (
+                    (self.gamma**self.nsteps)
+                    * max_next_q_values
+                    * (~tensor_exp.dones).float()
+                )
+            )
+
+        diff = (expected_q_values - current_q_values)
+        if self.priority_replay:
+            self.memory.update_priorities(
+                tensor_exp.indices, diff.detach().squeeze().abs().cpu().numpy().tolist()
+            )
+            loss = self.MSE(diff).squeeze() * core.as_default_tensor(tensor_exp.weights)
+        else:
+            loss = self.MSE(diff)
+        loss = loss.mean()
+
+        return loss
+
+
+    def morl_update(self, exp_: exp.Experience, frame=0):
+        if self.static_policy:
+            return None
+        self.morl_memory.add_(exp_)
+        if frame < self.learn_start or frame % self.update_freq != 0:
+            return None
+
+        # batch_vars = self.prep_minibatch()
+        samples = self.morl_memory.get_(beta=self.memory.beta_by_frame(frame))
+        tensor_exp = samples.as_default_tensor()
+
+        loss = self.morl_compute_loss(tensor_exp)
+
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.model.parameters():
+            param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
+        self.update_target_model()
+        self.save_td(loss.item(), frame)
+        self.save_sigma_param_magnitudes(frame)
 
     def update(self, s, a, r, s_, frame=0):
         if self.static_policy:
