@@ -13,6 +13,7 @@ from timeit import default_timer as timer
 from morl import api
 from morl import core
 from morl import experiences as exp
+from morl import memories
 
 class Model(BaseAgent):
     def __init__(self, static_policy=False, env=None, config=None, log_dir='/tmp/gym'):
@@ -74,6 +75,14 @@ class Model(BaseAgent):
 
     def declare_memory(self):
         self.memory = ExperienceReplayMemory(self.experience_replay_size) if not self.priority_replay else PrioritizedReplayMemory(self.experience_replay_size, self.priority_alpha, self.priority_beta_start, self.priority_beta_frames)
+        self.morl_memory = memories.AtariExperienceReplay(
+            batch_size=32,
+            capacity=self.experience_replay_size,
+            frame_stack=1,
+            state_height=84,
+            state_width=84,
+            n_steps=1,
+        )
 
     def append_to_replay(self, s, a, r, s_):
         self.nstep_buffer.append((s, a, r, s_))
@@ -181,7 +190,7 @@ class Model(BaseAgent):
             return None
 
         # batch_vars = self.prep_minibatch()
-        samples = self.morl_memory.get_(beta=self.memory.beta_by_frame(frame))
+        samples = self.morl_memory.get_()
         tensor_exp = samples.as_default_tensor()
 
         loss = self.morl_compute_loss(tensor_exp)
